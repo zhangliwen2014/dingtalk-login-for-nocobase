@@ -74,6 +74,32 @@ grep -rlc "authenticator=" *.js                                  # 0
 
 顺带记录两个已知弱点：扫码路径的 token 出现在 URL 上，会被 nginx access log 记下来（免登路径是 JSON body，不落日志）；`prompt=consent` 保持原样未动。
 
+## 3b. 部署后实测到的两个环境事实
+
+**客户端产物的真实 URL**（容器内 nginx `sites-enabled/nocobase.conf`）：
+
+```
+location /static/plugins/  →  alias /app/nocobase/node_modules/;  expires 365d;  access_log off;
+```
+
+所以浏览器加载的是 `https://device-mgmt.aiaocheng.com/static/plugins/nocobase-plugin-ding-talk/dist/client/index.js`
+（靠 `node_modules` 里那个符号链接指向 `storage/plugins/`）。两个后果：
+
+1. `expires 365d` 且文件名无内容 hash、URL 不带版本参数 → **老客户端可能被浏览器缓存住**，改完 `dist/client/index.js` 后需强制刷新（钉钉内要关掉微应用重进或清缓存）。
+2. 这一段的 `access_log off`，所以插件 JS 的加载请求**不会出现在 `nocobase.log` 里**，别拿访问日志判断客户端有没有拿到新代码；直接比对该 URL 的字节数/内容。
+
+**动作参数的位置**（`@nocobase/resourcer/lib/resourcer.js:250-262`）：query 与 body 会合并，但非 GET 时
+`params.values = ctx.request.body`（整个 body），**不是** body 里再套一层 `values`。
+手工 curl 要用扁平 body：
+
+```sh
+curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kfrhe7"}' \
+  https://device-mgmt.aiaocheng.com/api/community-ding-talk:getFreeLoginConfig
+# → {"data":{"corpId":null}}   # null 表示后台还没填 corpId，正常
+```
+
+写成 `{"values":{...}}` 会得到「认证器不能为空」，那是测试姿势错，不是代码 bug。
+
 ## 4. 顺手修掉的两个上游 bug
 
 - `DingTalkAuth.js` 构造函数里 `emailDomain.split("s*,s*")` 少了转义（应为 `/\s*,\s*/`）。生产值是 `aiaocheng.com,163.com`，错的分隔符使它变成**一个**含逗号的域名，邮箱域名白名单形同虚设。当前 `userCheckType=mobile`，该分支未被触发，但一旦改用邮箱匹配就会暴露。
@@ -83,7 +109,13 @@ grep -rlc "authenticator=" *.js                                  # 0
 ## 验证状态
 
 - `node --check`（容器内 Node v22.22.3，走 stdin，不落服务器磁盘）：4 个改动文件全部通过。
-- **未在浏览器/钉钉内实测**。免登需要：部署本补丁 + 后台填 `corpId` + 上面 4 项钉钉配置到位，然后由业务账号在钉钉内点击验证。
+- **2026-10-04 20:21 已部署到生产**（含免登 + token 接收 + corpId），部署后实测：
+  - `getFreeLoginConfig` → `{"data":{"corpId":null}}`（动作已注册、能取到认证器；`null` 是后台还没填 corpId）；
+  - `freeLogin` 用假 authCode → 钉钉返回 `40078 nonexistent temp auth code`（证明 action → `authManager.get` → `signIn` → `validate` → `getUserByAuthCode` 整条链打通，且错误干净返回、没写库）；
+  - 上游 `getAuthUrl` 仍返回正确的 `login.dingtalk.com` 授权 URL（扫码路径无回归）；
+  - `docker logs` 里没有插件加载错误，`system.log` 无新增异常；`authenticators:publicList` 仍回 `allowSignUp:false`；
+  - `/static/plugins/nocobase-plugin-ding-talk/dist/client/index.js` 已是新的 9069 字节产物（含 `freeLogin`/`requestAuthCode`/`nocobase-dingtalk-corpid`）。
+- **仍未在钉钉内实测**。差的只剩钉钉侧配置：后台填 `corpId`（或把首页地址设成带 `$CORPID$`）+ 上面 4 项前置条件，然后由业务账号在钉钉内点击验证。
 - 判定成功的依据：`select * from "usersAuthenticators"` 出现带 `uuid` 的行；且 nginx 日志里 `getFreeLoginConfig`/`freeLogin` 有命中、`redirectAuth` 不再被调用。
 
 ## 部署方式
@@ -97,16 +129,41 @@ grep -rlc "authenticator=" *.js                                  # 0
 | 宿主 | `/media/aocheng/Data/nocobase/plugins/nocobase-plugin-ding-talk` |
 | 容器内 | `/app/nocobase/storage/plugins/nocobase-plugin-ding-talk`（`node_modules` 下同名项是它的符号链接） |
 
-部署（在本仓库根目录）：
+### 按「可回退 + 只动这一个目录」来部署
 
 ```sh
+TS=$(date +%Y%m%dT%H%M%S)
 P=nocobase-plugin-ding-talk
 D=/media/aocheng/Data/nocobase/plugins/$P
+C=/app/nocobase/storage/plugins/$P          # 容器内看同一个目录
+
+# 1. 现状指纹（只读）。备份必须放在插件目录之外——NocoBase 会扫描 plugins 目录，
+#    放进去了会被当成另一个插件。
+ssh erp@192.168.3.63 "docker exec nocobase_app_1 sh -lc 'cd $C && find . -type f -print0 | xargs -0 sha256sum | sort -k2'" \
+  | sed -E 's/^([0-9a-f]{64}) [* ]+/\1  /' > /tmp/server_pre.txt
+
+# 2. 回退副本
+ssh erp@192.168.3.63 "mkdir -p ~/nocobase-plugin-backups && cp -a $D ~/nocobase-plugin-backups/$P.$TS"
+
+# 3. 上传（只覆盖 dist + package.json，不删任何东西）
 tar -C . -cf - dist package.json | ssh erp@192.168.3.63 "tar -C $D -xf -"
-ssh erp@192.168.3.63 "for f in server/auth/DingTalkAuth.js server/actions/dingTalkActions.js server/openapi/dingTalkApi.js client/index.js; do docker exec nocobase_app_1 node --check /app/nocobase/storage/plugins/$P/dist/\$f || exit 1; done && docker restart nocobase_app_1"
+
+# 4. 再指纹，比对——应当只有本次改的文件不同，条数不变
+ssh erp@192.168.3.63 "docker exec nocobase_app_1 sh -lc 'cd $C && find . -type f -print0 | xargs -0 sha256sum | sort -k2'" \
+  | sed -E 's/^([0-9a-f]{64}) [* ]+/\1  /' > /tmp/server_post.txt
+diff /tmp/server_pre.txt /tmp/server_post.txt
+
+# 5. 语法检查 + 重启（服务端代码在启动时 require，改完必须重启容器）
+ssh erp@192.168.3.63 "for f in server/auth/DingTalkAuth.js server/actions/dingTalkActions.js server/openapi/dingTalkApi.js client/index.js; do docker exec nocobase_app_1 node --check $C/dist/\$f || exit 1; done && docker restart nocobase_app_1"
 ```
 
-服务端代码在启动时 require，改完必须重启容器；客户端产物由浏览器加载，重启后需强制刷新（Ctrl+F5）才会拿到新的 `index.js`。
+回退（同一台机器，不用本地文件）：
+
+```sh
+ssh erp@192.168.3.63 "rm -rf $D && cp -a ~/nocobase-plugin-backups/$P.$TS $D && docker restart nocobase_app_1"
+```
+
+客户端产物由浏览器加载，重启后需强制刷新（Ctrl+F5，钉钉内要退出微应用重进）才会拿到新的 `index.js`。
 
 ## 重要限制
 
