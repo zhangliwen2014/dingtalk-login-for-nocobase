@@ -117,8 +117,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
   - 上游 `getAuthUrl` 仍返回正确的 `login.dingtalk.com` 授权 URL（扫码路径无回归）；
   - `docker logs` 里没有插件加载错误，`system.log` 无新增异常；`authenticators:publicList` 仍回 `allowSignUp:false`；
   - `/static/plugins/nocobase-plugin-ding-talk/dist/client/index.js` 已是新的 9069 字节产物（含 `freeLogin`/`requestAuthCode`/`nocobase-dingtalk-corpid`）。
-- **仍未在钉钉内实测**。差的只剩钉钉侧配置：后台填 `corpId`（或把首页地址设成带 `$CORPID$`）+ 上面 4 项前置条件，然后由业务账号在钉钉内点击验证。
-- 判定成功的依据：`select * from "usersAuthenticators"` 出现带 `uuid` 的行；且 nginx 日志里 `getFreeLoginConfig`/`freeLogin` 有命中、`redirectAuth` 不再被调用。
+- ~~**仍未在钉钉内实测**~~ —— **已于 22:31 真机验证通过**（iPhone 钉钉 + PC 钉钉，见下文「免登已在真机跑通」）。20:21 这一版当时确实还没跑通，卡在 JSAPI 加载；后面又迭代了四次（21:40 / 21:52 / 22:05 / 22:18 / 22:26）才通。
+- 判定成功的依据（已满足）：nginx 日志里浏览器发起 `getFreeLoginConfig` + `freeLogin` 200，且**同一次会话的 `auth:check` 由 401 变 200**；`usersAuthenticators` 保持 1 行（`userId=2`／`uuid=016825045624390379`），说明走的是「按钉钉 `userid` 命中既有绑定」而不是手机号匹配。
 
 ### 20:21 那次部署后的实测结果：免登没被触发，原因不可见 → 第二次迭代（21:40）
 
@@ -245,6 +245,19 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 **22:26 上线**：`dist/client/index.js` → `bbf35e6546dace0b82f96b3b06d81701d23faf8d9533ad92de07d0664ee62b0b`，改前留为同目录 `index.js.bak.20261004e`（`a7350f38…`）；`vm.Script` 通过，下发 URL `?hash=ab493001`，取回内容与仓库逐字节一致。
 
 **还剩的一件事不是代码问题**：CorpId 目前完全依赖「从工作台入口 + 首页地址带 `$CORPID$`」。建议同时在后台认证器配置的「企业 CorpId」一格里填上值（存 `options.internal.corpId`，jsonb，无 schema 变更），这样任何入口都能免登；否则从 `/signin` 直接进来时仍会因 `stage=corpId` 回退扫码。
+
+### 免登已在真机跑通（22:31，iPhone 钉钉 + PC 钉钉）
+
+| 时间 | 事实 |
+|---|---|
+| 22:27:14 → 22:27:17 | PC 普通浏览器扫码/确认：`redirectAuth` 302 → `auth:check` **200**（扫码路径无回归） |
+| 22:31:19 | iPhone 钉钉进入 `/m?corpId=ding…`，`auth:check` **401**（尚未登录） |
+| 22:31:21 | `POST …:freeLogin` **200** |
+| 22:31:22 | `auth:check` **200**，referer 已是 `https://device-mgmt.aiaocheng.com/m?corpId=ding…` —— **免登成功且已离开登录页落到工作台** |
+| 22:31:47 / 22:31:58 | 另两次从 `/signin?redirect=`（redirect 为空）发起的 `freeLogin` 同样 200，22:31:48 `auth:check` 200 且 referer 变成 `/admin` —— `redirectTarget()` 的空值回落 `/admin` 生效 |
+
+身份没有走偏：`usersAuthenticators` 仍只有 1 行（`authenticator=s_m6bd8kfrhe7`／`userId=2`／`uuid=016825045624390379`，创建于 15:31），免登是先按钉钉 `userid` 命中既有绑定再签发，**没有**因为 `userCheckType=mobile` 而撞上同号的其它账号。这一点很重要：库里 13 个用户有手机号、其中存在同号，若匹配顺序反过来就可能登进别人的账号。
+
 
 
 ## 部署方式
