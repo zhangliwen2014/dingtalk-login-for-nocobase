@@ -1,0 +1,8 @@
+# 本仓库保存的是发布产物（dist），需要按字节部署到服务器，
+# 因此禁止 Git 做任何换行符转换，否则 Windows 检出后与服务器内容不一致。
+* -text
+
+# 若后续把上游 TypeScript 源码纳进来，再按需调整。
+*.png binary
+*.jpg binary
+*.ico binary
