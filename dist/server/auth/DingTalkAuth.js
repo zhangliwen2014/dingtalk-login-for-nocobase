@@ -65,7 +65,11 @@ class DingTalkAuth extends import_auth.BaseAuth {
   async #resolveDingUser() {
     const ctx = this.ctx;
     const { code, authCode } = this.#credentialParams();
-    if (authCode) {
+    // 必须以 code 优先：钉钉统一授权页的回调会**同时**带 code 和 authCode 且取值相同
+    //（2026-10-04 21:48 生产实测），那是 OAuth 2.0 授权码，拿它去调免登的 getuserinfo
+    // 必然 40078 nonexistent temp auth code，把原本可用的扫码路径整个弄坏。
+    // 免登路径只带 authCode（freeLogin 动作），所以两条路仍互不干扰。
+    if (authCode && !code) {
       const info = await this.dingTalkApi.contact.getUserByAuthCode(authCode);
       const detail = await this.dingTalkApi.contact.getUserDetail(info.userid);
       return {

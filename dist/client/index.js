@@ -17,15 +17,47 @@ function ssGet(k){try{return sessionStorage.getItem(k);}catch(e){return null;}}
 function ssSet(k,v){try{sessionStorage.setItem(k,v);}catch(e){}}
 function ssDel(k){try{sessionStorage.removeItem(k);}catch(e){}}
 var jsapiLoading;
+function grabDd(){
+  if(window.dd&&typeof window.dd==="object")return window.dd;
+  var ex=window.exports; // UMD 万一走了 exports 分支也别白丢
+  if(ex&&ex.dd)return ex.dd;
+  return null;
+}
+function viaRequireJs(){
+  // 必须让 requirejs 自己注入脚本：匿名 define 只有和「当前正在加载的 script」配对才能被解析出来
+  return new Promise(function(resolve,reject){
+    var done=false;
+    var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("requirejs 加载 JSAPI 超时"));},10000);
+    var fail=function(e){if(done)return;done=true;clearTimeout(timer);reject(new Error("requirejs:"+String((e&&(e.message||e.requireType))||e).slice(0,120)));};
+    try{
+      window.requirejs([JSAPI_SRC],function(m){
+        if(done)return;done=true;clearTimeout(timer);
+        var dd=m||grabDd();
+        if(dd)resolve(dd);else reject(new Error("requirejs 返回的模块为空"));
+      },fail);
+    }catch(e){fail(e);}
+  });
+}
 function loadJsApi(){
   if(typeof window==="undefined"||typeof document==="undefined")return Promise.reject(new Error("no browser"));
-  if(window.dd&&window.dd.env)return Promise.resolve(window.dd);
+  var have=grabDd();
+  if(have&&have.env)return Promise.resolve(have);
+  // NocoBase 的 PluginManager.initRequireJs() 会设 window.define = requirejs.define（见 SPA 的
+  // p__index.*.async.js），而 CDN 上的 dingtalk.open.js 是 UMD：它优先走 define([],factory)，
+  // 于是自己 <script src> 注入时 onload 成功却没有 window.dd（2026-10-04 21:46 实测 dbg=jsapi|…）。
+  if(typeof window.requirejs==="function"){jsapiLoading=viaRequireJs();return jsapiLoading;}
   if(!jsapiLoading){
     jsapiLoading=new Promise(function(resolve,reject){
       var s=document.createElement("script");
       s.src=JSAPI_SRC;
       s.async=true;
-      s.onload=function(){window.dd?resolve(window.dd):reject(new Error("JSAPI 已加载但没有 window.dd"));};
+      s.onload=function(){
+        var dd=grabDd();
+        if(dd)return resolve(dd);
+        // 走到这里说明 define 被页面的 AMD 加载器接管了；它可能稍后才挂上 requirejs
+        if(typeof window.requirejs==="function")return resolve(viaRequireJs());
+        reject(new Error("JSAPI 已加载但没有 window.dd"));
+      };
       s.onerror=function(){jsapiLoading=null;reject(new Error("钉钉 JSAPI 加载失败"));};
       document.head.appendChild(s);
     });
@@ -34,7 +66,8 @@ function loadJsApi(){
   return new Promise(function(resolve,reject){
     var done=false;
     var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("钉钉 JSAPI 加载超时"));},8000);
-    jsapiLoading.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);},function(e){if(done)return;done=true;clearTimeout(timer);reject(e);});
+    var p=jsapiLoading;
+    p.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);},function(e){if(done)return;done=true;clearTimeout(timer);reject(e);});
   });
 }
 function mkErr(stage,msg){var e=new Error(String(msg==null?stage:msg).slice(0,300));e.stage=stage;return e;}
