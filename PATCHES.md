@@ -204,7 +204,26 @@ ssh erp@192.168.3.63 "for f in server/auth/DingTalkAuth.js server/actions/dingTa
 ssh erp@192.168.3.63 "rm -rf $D && cp -a ~/nocobase-plugin-backups/$P.$TS $D && docker restart nocobase_app_1"
 ```
 
-客户端产物由浏览器加载，重启后需强制刷新（Ctrl+F5，钉钉内要退出微应用重进）才会拿到新的 `index.js`。
+### 只改客户端时的最小流程（21:40 那次就是这么做的）
+
+```sh
+D=/media/aocheng/Data/nocobase/plugins/nocobase-plugin-ding-talk/dist/client
+# 1. 备份 + 现状指纹
+ssh erp@192.168.3.63 "cp -a $D/index.js $D/index.js.bak.<标记> && sha256sum $D/index.js"
+# 2. 原子替换（tmp + mv；mv 不改内容，mtime 变成 now，这正是下面 hash 会变的来源）
+cat dist/client/index.js | ssh erp@192.168.3.63 "cat > $D/index.js.new && mv $D/index.js.new $D/index.js && sha256sum $D/index.js && stat -c '%s %y' $D/index.js"
+# 3. 容器内语法检查，然后重启
+ssh erp@192.168.3.63 "docker exec nocobase_app_1 node --check /app/nocobase/storage/plugins/nocobase-plugin-ding-talk/dist/client/index.js && docker restart nocobase_app_1"
+# 4. 等就绪，确认下发的 URL 变了、且该 URL 取回的就是新内容
+ssh erp@192.168.3.63 'for i in $(seq 1 40); do [ "$(curl -s -o /dev/null -w %{http_code} --max-time 3 http://127.0.0.1:13000/)" = 200 ] && break; sleep 5; done
+H=$(curl -s http://127.0.0.1:13000/api/pm:listEnabled | grep -o "/static/plugins/nocobase-plugin-ding-talk/dist/client/index.js?hash=[0-9a-f]*")
+echo "$H"; curl -s "http://127.0.0.1:13000$H" | sha256sum'
+```
+
+第 4 步是**必须**的：`?hash=` 由 `dist/client/index.js` 的 mtime 算出并缓存在进程内存里，
+不重启就还是旧 hash，配合 `/static/plugins/` 的 `expires 365d`，浏览器会一直用缓存里的旧代码。
+21:40 实测：重启后 URL 从 `?hash=027627ac` 变成 `?hash=cdbdcdeb`，该 URL 取回的 sha256 与本地文件一致 ——
+所以**不需要让用户清缓存或强制刷新**（`pm:listEnabled` 自身是 `no-store`，每次刷新都会拿到新 URL）。
 
 ## 重要限制
 
