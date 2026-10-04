@@ -25,31 +25,67 @@ function loadJsApi(){
       var s=document.createElement("script");
       s.src=JSAPI_SRC;
       s.async=true;
-      s.onload=function(){resolve(window.dd);};
+      s.onload=function(){window.dd?resolve(window.dd):reject(new Error("JSAPI 已加载但没有 window.dd"));};
       s.onerror=function(){jsapiLoading=null;reject(new Error("钉钉 JSAPI 加载失败"));};
       document.head.appendChild(s);
     });
   }
-  return jsapiLoading;
-}
-function inDingTalk(dd){
-  return !!(dd&&dd.env&&dd.env.platform&&dd.env.platform!=="notInDingTalk");
-}
-function requestAuthCode(dd,corpId){
+  // 弱网下 script 可能既不 onload 也不 onerror，没有超时的话按钮会一直转圈，连回退都不会发生
   return new Promise(function(resolve,reject){
-    var onOk=function(res){resolve(res&&(res.code||res.authCode));};
-    var onFail=function(err){reject(typeof err==="object"?new Error(JSON.stringify(err)):err);};
-    var run=function(){
-      if(dd.runtime&&dd.runtime.permission&&dd.runtime.permission.requestAuthCode){
-        dd.runtime.permission.requestAuthCode({corpId:corpId,onSuccess:onOk,onFail:onFail});
-      }else if(dd.getAuthCode){
-        dd.getAuthCode({corpId:corpId,onSuccess:onOk,onFail:onFail});
-      }else{
-        onFail(new Error("当前钉钉容器不提供免登 JSAPI"));
-      }
-    };
-    if(dd.ready)dd.ready(run);else run();
+    var done=false;
+    var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("钉钉 JSAPI 加载超时"));},8000);
+    jsapiLoading.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);},function(e){if(done)return;done=true;clearTimeout(timer);reject(e);});
   });
+}
+function mkErr(stage,msg){var e=new Error(String(msg==null?stage:msg).slice(0,300));e.stage=stage;return e;}
+function requestAuthCode(dd,corpId){
+  dd=dd||{};
+  // 新版钉钉微应用容器（入口 URL 带 dd_debug_unifiedAppId）只提供 3.x 的 dd.getAuthCode，
+  // 老容器只有 dd.runtime.permission.requestAuthCode，所以两个都试；容器不回调时靠超时往下走。
+  var list=[];
+  if(typeof dd.getAuthCode==="function")list.push({name:"getAuthCode",run:function(o){return dd.getAuthCode(o);}});
+  if(dd.runtime&&dd.runtime.permission&&typeof dd.runtime.permission.requestAuthCode==="function"){
+    list.push({name:"requestAuthCode",run:function(o){var call=function(){dd.runtime.permission.requestAuthCode(o);};if(dd.ready)dd.ready(call);else call();}});
+  }
+  var envOf=function(){return (dd&&dd.env&&dd.env.platform)||"?";};
+  if(!list.length)return Promise.reject(mkErr("authcode","容器未提供免登接口 env="+envOf()));
+  function once(item){
+    return new Promise(function(resolve,reject){
+      var done=false;
+      var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("无响应"));},6000);
+      var finish=function(f,v){if(done)return;done=true;clearTimeout(timer);f(v);};
+      var o={corpId:corpId,onSuccess:function(res){finish(resolve,res&&(res.code||res.authCode));},onFail:function(err){finish(reject,mkErr(item.name,typeof err==="string"?err:safe(err)));}};
+      try{
+        var p=item.run(o);
+        if(p&&typeof p.then==="function")p.then(function(res){finish(resolve,res&&(res.code||res.authCode));},function(err){finish(reject,mkErr(item.name,typeof err==="string"?err:safe(err)));});
+      }catch(e){finish(reject,mkErr(item.name,(e&&e.message)||e));}
+    });
+  }
+  function attempt(i,reasons){
+    if(i>=list.length)return Promise.reject(mkErr("authcode",reasons.join(" ; ")+" env="+envOf()));
+    var item=list[i];
+    return once(item).then(function(code){
+      if(code)return code;
+      return attempt(i+1,reasons.concat(item.name+":空返回"));
+    }).catch(function(e){
+      return attempt(i+1,reasons.concat(item.name+":"+((e&&e.message)||e)));
+    });
+  }
+  return attempt(0,[]);
+}
+function safe(v){try{return JSON.stringify(v);}catch(e){return String(v);}}
+function serverMsg(e){
+  var d=e&&e.response&&e.response.data;
+  var first=d&&d.errors&&d.errors[0];
+  return String((first&&(first.message||first.code))||(d&&d.error)||(e&&e.message)||safe(e)).slice(0,300);
+}
+function dbgOf(err){
+  // 失败原因要出现在 nginx 的 request 行里（客户端 console 拿不到），所以只留 ASCII 并压平
+  var msg=String((err&&err.message)||safe(err)||"?").replace(/[^ -~]/g,"?")
+    // 服务端个别报错会带上邮箱/手机号，而这些分支本身才是线索，不能把个人标识一起写进访问日志
+    .replace(/[\w.+-]+@[\w.-]+/g,"[mail]").replace(/\d{7,}/g,"[num]")
+    .replace(/[(){}<>&;'",]/g," ").slice(0,140);
+  return ((err&&err.stage)||"?")+"|"+msg;
 }
 function pickTokenFromUrl(app){
   // 扫码登录回跳：redirectAuth 把 token 放在 URL 上。NocoBase 2.x 客户端不会读 URL 里的 token，
@@ -76,8 +112,11 @@ var makeSignInButton=function(app){
     var authenticator=props.authenticator;
     var st=u.useState(false), loading=st[0], setLoading=st[1];
     var resource=t.useResource("community-ding-talk");
-    var scanLogin=function(){
-      return resource.getAuthUrl({values:{authenticator:authenticator.name,redirect:new URLSearchParams(location.search?location.search.substring(1):"").get("redirect")||""}}).then(function(m){
+    var scanLogin=function(dbg){
+      var params={values:{authenticator:authenticator.name,redirect:new URLSearchParams(location.search?location.search.substring(1):"").get("redirect")||""}};
+      // 免登为什么失败只能靠这一行日志回传（nginx 记录 request 行，不含 POST body）
+      if(dbg)params.dbg=dbg;
+      return resource.getAuthUrl(params).then(function(m){
         var url=m&&m.data&&m.data.data;
         if(typeof url!=="string"||url.indexOf("https://login.dingtalk.com/")!==0)throw new Error("getAuthUrl 返回异常");
         ssSet(PENDING_KEY,authenticator.name);
@@ -86,7 +125,7 @@ var makeSignInButton=function(app){
     };
     var freeLogin=function(){
       // 先用 UA 判断，避免在非钉钉环境里白拉一次 JSAPI
-      if(!/DingTalk/i.test(navigator.userAgent||""))return Promise.reject(new Error("不在钉钉客户端内"));
+      if(!/DingTalk/i.test(navigator.userAgent||""))return Promise.reject(mkErr("ua","不在钉钉客户端内"));
       // corpId 两个来源，优先容器注入的那个：钉钉应用首页地址写成 …?corpId=$CORPID$ 时，
       // 从工作台打开会被容器替换成真实 CorpId，无需在后台手抄
       var fromUrl=ssGet(CORPID_KEY);
@@ -95,30 +134,29 @@ var makeSignInButton=function(app){
         return resource.getFreeLoginConfig({values:{authenticator:authenticator.name}}).then(function(m){
           var d=m&&m.data&&m.data.data;
           return d&&d.corpId;
-        });
+        },function(e){throw mkErr("corpIdReq",serverMsg(e));});
       };
       return corpIdOf().then(function(corpId){
-        if(!corpId)throw new Error("拿不到企业 CorpId：请在钉钉应用首页地址加 ?corpId=$CORPID$，或在认证器配置里填「企业 CorpId」");
+        if(!corpId)throw mkErr("corpId","拿不到企业 CorpId：请在钉钉应用首页地址加 ?corpId=$CORPID$，或在认证器配置里填「企业 CorpId」");
         return loadJsApi().then(function(dd){
-          if(!inDingTalk(dd))throw new Error("不在钉钉客户端内");
           return requestAuthCode(dd,corpId);
-        });
+        },function(e){throw mkErr("jsapi",(e&&e.message)||e);});
       }).then(function(authCode){
-        if(!authCode)throw new Error("免登授权码为空");
-        return resource.freeLogin({values:{authenticator:authenticator.name,authCode:authCode}});
-      }).then(function(res){
-        var data=res&&res.data&&res.data.data;
-        if(!data||!data.token)throw new Error("免登未返回 token");
-        app.auth.setAuthenticator(data.authenticator||authenticator.name);
-        app.auth.setToken(data.token);
-        window.location.reload();
+        if(!authCode)throw mkErr("authcode","免登授权码为空");
+        return resource.freeLogin({values:{authenticator:authenticator.name,authCode:authCode}}).then(function(res){
+          var data=res&&res.data&&res.data.data;
+          if(!data||!data.token)throw mkErr("server","免登未返回 token");
+          app.auth.setAuthenticator(data.authenticator||authenticator.name);
+          app.auth.setToken(data.token);
+          window.location.reload();
+        },function(e){throw mkErr("server",serverMsg(e));});
       });
     };
     var onClick=function(){
       setLoading(true);
       return freeLogin().catch(function(err){
         console.error("[ding-talk] 免登失败，回退扫码登录：",err);
-        return scanLogin().catch(function(err2){
+        return scanLogin(dbgOf(err)).catch(function(err2){
           setLoading(false);
           var msg=(err2&&err2.message)||(err&&err.message)||"钉钉登录失败";
           if(l.message&&l.message.error)l.message.error(msg);else console.error("[ding-talk] "+msg);
@@ -135,9 +173,10 @@ var AdminSettingsForm=function(props){
 function captureCorpIdFromUrl(){
   // 必须在 load() 里最早执行：路由跳转会丢参数，$CORPID$ 替换出来的值只有入口这一趟拿得到
   if(typeof window==="undefined")return;
-  var usp=new URLSearchParams(window.location.search);
-  var corpId=usp.get("corpId")||usp.get("corpid");
-  if(corpId&&/^ding[a-z0-9]+$/i.test(corpId))ssSet(CORPID_KEY,corpId);
+  // 直接匹配整条 URL：登录守卫会把入口地址塞进 redirect，此时 corpId 不再是顶层参数
+  // （实测 referer 为 /signin?redirect=/m?corpId=ding…），只查 location.search 会漏掉
+  var m=/[?&]corpid=(ding[a-z0-9]+)/i.exec(window.location.href);
+  if(m)ssSet(CORPID_KEY,m[1]);
 }
 class i extends t.Plugin{afterAdd(){return Promise.resolve()}beforeLoad(){return Promise.resolve()}load(){return Promise.resolve().then(()=>{captureCorpIdFromUrl();pickTokenFromUrl(this.app);this.app.pm.get(o).registerType("community-ding-talk-auth",{components:{SignInButton:makeSignInButton(this.app),AdminSettingsForm}})})}}
 e.NocobasePluginDingTalkClient=i;e.default=i;Object.defineProperties(e,{__esModule:{value:!0},[Symbol.toStringTag]:{value:"Module"}})});
