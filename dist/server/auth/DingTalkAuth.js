@@ -104,7 +104,7 @@ class DingTalkAuth extends import_auth.BaseAuth {
     }
     let ncUser = await this.userRepository.findOne({ filter });
     if (ncUser) {
-      await this.authenticator.addUser(user, {
+      await this.authenticator.addUser(ncUser, {
         through: {
           uuid: userId
         }
