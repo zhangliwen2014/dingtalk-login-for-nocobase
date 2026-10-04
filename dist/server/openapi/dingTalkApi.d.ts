@@ -75,6 +75,19 @@ export declare class DingTalkApi {
          */
         getUser(unionId: string, accessToken: string): Promise<UserRes>;
         /**
+         * 免登码换身份（钉钉客户端内 H5 微应用免登）
+         * @param code dd.runtime.permission.requestAuthCode 取得的免登授权码，5 分钟内有效且只能使用一次。
+         * @returns { userid, name, sys_level, usr_ident, device_id, is_sys_admin }
+         */
+        getUserByAuthCode(code: string): Promise<{
+            userid: string;
+            name: string;
+            sys_level?: number;
+            is_sys_admin?: boolean;
+            usr_ident?: string;
+            device_id?: string;
+        }>;
+        /**
          * 根据手机号查询用户ID
          * @param mobile 用户的手机号。
          * @returns 员工的userId。

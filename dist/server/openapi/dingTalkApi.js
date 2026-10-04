@@ -78,6 +78,18 @@ class DingTalkApi {
         });
       },
       /**
+       * 免登码换身份（钉钉客户端内 H5 微应用免登）
+       * @param code 免登授权码，由 dd.runtime.permission.requestAuthCode 取得；5 分钟内有效且只能使用一次。
+       * @returns { userid, name, sys_level, usr_ident, device_id, is_sys_admin }
+       */
+      async getUserByAuthCode(code) {
+        return checkResult(await api.doRequest("POST", `https://oapi.dingtalk.com/topapi/v2/user/getuserinfo`, {
+          access_token: await api.getAccessToken()
+        }, {
+          code
+        }));
+      },
+      /**
        * 根据手机号查询用户ID
        * @param mobile 用户的手机号。
        * @returns 员工的userId。

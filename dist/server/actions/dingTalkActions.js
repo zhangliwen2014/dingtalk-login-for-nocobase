@@ -36,6 +36,40 @@ function getReqUrl(req) {
   return process.env.APP_URL || `${proto}://${host}${process.env.APP_PUBLIC_PATH || "/"}`;
 }
 const dingTalkActions = {
+  /**
+   * 钉钉客户端内免登所需配置。只回 corpId，appKey/appSecret 一律不出服务端。
+   */
+  getFreeLoginConfig: async (ctx, next) => {
+    const { authenticator: authenticatorName } = ctx.action.params.values || ctx.action.params;
+    if (!authenticatorName) {
+      ctx.throw(400, "\u8BA4\u8BC1\u5668\u4E0D\u80FD\u4E3A\u7A7A");
+    }
+    const auth = await ctx.app.authManager.get(authenticatorName, ctx);
+    ctx.body = { corpId: auth.corpId || null };
+    await next();
+  },
+  /**
+   * 免登：客户端用 JSAPI 取到 authCode，POST 到此接口直接换 NocoBase token（不整页跳转）。
+   */
+  freeLogin: async (ctx, next) => {
+    const params = ctx.action.params;
+    const values = params.values || {};
+    const authenticatorName = params.authenticator ?? values.authenticator;
+    const authCode = params.authCode ?? values.authCode;
+    if (!authenticatorName) {
+      ctx.throw(400, "\u8BA4\u8BC1\u5668\u4E0D\u80FD\u4E3A\u7A7A");
+    }
+    if (!authCode) {
+      ctx.throw(400, "\u514D\u767B\u6388\u6743\u7801\u4E0D\u5B58\u5728");
+    }
+    const auth = await ctx.app.authManager.get(authenticatorName, ctx);
+    const { token } = await auth.signIn();
+    if (!token) {
+      ctx.throw(401, "\u9489\u9489\u8EAB\u4EFD\u672A\u5173\u8054\u5230\u7CFB\u7EDF\u7528\u6237");
+    }
+    ctx.body = { token, authenticator: authenticatorName };
+    await next();
+  },
   getAuthUrl: async (ctx, next) => {
     const { authenticator: authenticatorName, redirect } = ctx.action.params.values;
     if (!authenticatorName) {
