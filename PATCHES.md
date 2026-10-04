@@ -55,6 +55,8 @@
 
 ## 3. `dist/client/index.js` — 回跳的 token 之前根本没人读
 
+> **22:05 更正**：本节「没有任何从 URL 取 token 的代码」这个结论是**错的**，来源是 grep 只扫了 `@nocobase/app/dist/client`，漏掉 `plugin-auth` 的懒加载分块 `249.*.js` —— 那里的 `AuthProvider` 已经在做同一件事。下面的两个 grep 命令保留原文以备追溯，但请连同「第三次迭代（22:05）」一节一起读：`pickTokenFromUrl` 属于重复实现，且它当时把整站崩成了错误边界。
+
 `redirectAuth` 把凭证拼在 URL 上回跳：`…?authenticator=X&token=Y`。这是 NocoBase 1.x 客户端的行为；
 在 2.0.61 的产物里实测**没有**任何从 URL 取 token 的代码：
 
@@ -171,7 +173,41 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 
 **21:52 上线**：`dist/client/index.js` → `92809b02644c77ba5a4016030b6c8f31e5887c4681c992933f6137bfe0cab678`，`dist/server/auth/DingTalkAuth.js` → `8e7bbe1f0f5baf61630606d8346a33919e30a1f8b82126b5aef25c274e7d91dd`；改前分别留为同目录 `index.js.bak.20261004b`、`DingTalkAuth.js.bak.20261004b`；两文件 `node --check` 通过，重启后 200、`publicList` 正常、无插件加载错误，下发 URL 变为 `?hash=051e9460` 且取回内容 sha256 与仓库一致（提交 `71de2a9`）。
 
+验证（21:57–21:58 访问日志）：`getAuthUrl?dbg=ua|…`（非钉钉浏览器，正确回退）→ `redirectAuth?…&code=T&authCode=T&state=S` **status=302** → 21:58:00 起 `themeConfig:list`/`collections:listMeta`/`t_device_list:list`/`/ws` 全部 200，即已认证进入 `/admin`。**扫码登录恢复。**
+
 教训：给一个已有登录方式加第二条路径时，**任何「参数同时出现在两条路径上」的优先级判断都必须在真机回归旧路径**，不能只在服务端造请求测新路径 —— 这次 `code`/`authCode` 同名同值只有真实回调才会暴露。
+
+### 第三次迭代（22:05）：`app.auth` 是 undefined，扫码回跳会崩在错误边界上
+
+用户反馈「先出现 App error：`Cannot read properties of undefined (reading 'setAuthenticator')`，点击重试进入」——即 21:57/21:58 那两次的 302 之后，页面先白屏报错、要再点一次才进去。
+
+| 观测 | 结论 |
+|---|---|
+| 全 SPA 产物 `grep -o "[A-Za-z_$.]*\.auth\.set[A-Za-z]*"`（`node_modules/@nocobase/plugin-*/dist/client`） | 命中形如 `t.apiClient.auth.setToken` / `t.app.apiClient.auth.setToken`，**没有一处** `app.auth.*` |
+| `plugin-auth/dist/client/249.58d8f01251c04f59.js` 的 `AuthProvider` | 它本来就做 `useEffect`：`new URLSearchParams(location.search)` → `token` 存在则 `apiClient.auth.setToken(token)` + `setAuthenticator(authenticator)` + 抹参数 `navigate(replace)` |
+
+两处结论：
+
+1. **本补丁第 3 节的前提有误**。「2.0.61 里没有任何从 URL 取 token 的代码」这个 grep 只扫了 `@nocobase/app/dist/client`，漏了 `plugin-auth` 的懒加载分块 `249.*.js`。所以「重试就能进」正是 `AuthProvider` 接手了 URL 上的 token。
+2. **崩溃点是 `app.auth`**。2.0.61 的 `Application` 上认证实例挂在 **`app.apiClient.auth`**，`app.auth` 为 undefined；而 `pickTokenFromUrl()` 跑在 `load()`（启动路径）里，抛出后整个 SPA 落进错误边界。
+
+改法（`dist/client/index.js`）：
+
+| 改动 | 目的 |
+|---|---|
+| 新增 `authOf(app)`：依次尝试 `app.apiClient.auth` → `app.client.auth` → `app.auth`，并要求同时有 `setToken`/`setAuthenticator` | 不再猜属性名；取不到就返回 null 而不是抛 |
+| `pickTokenFromUrl()` 拿不到 auth 就 `return false`（且**先不删** `nocobase-dingtalk-pending`） | 让位给 `AuthProvider`，绝不因诊断/兜底代码把应用带崩 |
+| `load()` 里 `pickTokenFromUrl` 整段 `try/catch` + `console.error` | 启动路径任何异常都不应变成白屏 |
+| `freeLogin` 成功后写 token 也走 `authOf(app)`，取不到报 `stage=auth` 而不是崩 | 免登路径同一问题 |
+
+**22:05 上线**：`dist/client/index.js` → `b3047dcbba5629289380af4bac6bd86e1b772dad03c664554b6d683b460502a3`（14691 字节），改前留为同目录 `index.js.bak.20261004c`（即 `92809b02…`）；容器内 `vm.Script` 语法检查通过，`docker restart` 后 `pm:listEnabled` 下发 URL 变为 `?hash=8960b0c8`，该 URL 取回内容 sha256 与仓库逐字节一致；`docker logs --since 3m` 与 `system.log` 无 error/fatal。
+
+仍未闭环的部分：`pickTokenFromUrl` 现在只是 `AuthProvider` 的**重复实现**（它连 pending 键都不需要）。等免登在钉钉内验证通过，应考虑直接删掉它，只保留 `freeLogin` 那条路径。
+
+教训：
+
+- 「grep 全 SPA 产物」必须把**所有** `plugin-*/dist/client`（含数字分块）一起扫，只扫主包会得出相反的结论。
+- 启动路径（`load()`）里的任何自加逻辑都要假定外部 API 可能不存在；一个未加保护的属性访问会把整站变白屏，比原来的功能缺失严重得多。
 
 
 ## 部署方式

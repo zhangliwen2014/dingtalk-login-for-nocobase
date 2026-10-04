@@ -120,22 +120,39 @@ function dbgOf(err){
     .replace(/[(){}<>&;'",]/g," ").slice(0,140);
   return ((err&&err.stage)||"?")+"|"+msg;
 }
+function authOf(app){
+  // NocoBase 2.0.61 的认证实例挂在 app.apiClient.auth（见 plugin-auth 客户端 AuthProvider），
+  // 直接写 app.auth 会取到 undefined 并让整个应用崩在错误边界上；多兼容几种形态，取到能用的那个
+  var cands=[app&&app.apiClient&&app.apiClient.auth, app&&app.client&&app.client.auth, app&&app.auth];
+  for(var i=0;i<cands.length;i++){
+    var a=cands[i];
+    if(a&&typeof a.setToken==="function"&&typeof a.setAuthenticator==="function")return a;
+  }
+  return null;
+}
 function pickTokenFromUrl(app){
-  // 扫码登录回跳：redirectAuth 把 token 放在 URL 上。NocoBase 2.x 客户端不会读 URL 里的 token，
-  // 所以这里取回来写进 auth，再把参数抹掉并重新加载。只接受本标签页自己发起的那次回跳。
+  // 扫码登录回跳：redirectAuth 把 token 放在 URL 上。插件自身的 AuthProvider 也会处理，
+  // 这里只是提前一步把它收进 auth 并抹掉参数；拿不到 auth 就放弃，绝不让 load() 抛异常。
   if(typeof window==="undefined")return false;
   var usp=new URLSearchParams(window.location.search);
   var token=usp.get("token");
   var authenticator=usp.get("authenticator");
   if(!token||!authenticator)return false;
   if(ssGet(PENDING_KEY)!==authenticator)return false;
+  var auth=authOf(app);
+  if(!auth)return false;
+  try{
+    auth.setAuthenticator(authenticator);
+    auth.setToken(token);
+  }catch(e){
+    console.error("[ding-talk] 写入 token 失败，交由插件处理：",e);
+    return false;
+  }
   ssDel(PENDING_KEY);
   usp.delete("token");
   usp.delete("authenticator");
   var query=usp.toString();
   var clean=window.location.pathname+(query?"?"+query:"")+window.location.hash;
-  app.auth.setAuthenticator(authenticator);
-  app.auth.setToken(token);
   window.history.replaceState({}, "", clean);
   window.location.reload();
   return true;
@@ -179,8 +196,10 @@ var makeSignInButton=function(app){
         return resource.freeLogin({values:{authenticator:authenticator.name,authCode:authCode}}).then(function(res){
           var data=res&&res.data&&res.data.data;
           if(!data||!data.token)throw mkErr("server","免登未返回 token");
-          app.auth.setAuthenticator(data.authenticator||authenticator.name);
-          app.auth.setToken(data.token);
+          var auth=authOf(app);
+          if(!auth)throw mkErr("auth","客户端 auth 未就绪");
+          auth.setAuthenticator(data.authenticator||authenticator.name);
+          auth.setToken(data.token);
           window.location.reload();
         },function(e){throw mkErr("server",serverMsg(e));});
       });
@@ -211,5 +230,5 @@ function captureCorpIdFromUrl(){
   var m=/[?&]corpid=(ding[a-z0-9]+)/i.exec(window.location.href);
   if(m)ssSet(CORPID_KEY,m[1]);
 }
-class i extends t.Plugin{afterAdd(){return Promise.resolve()}beforeLoad(){return Promise.resolve()}load(){return Promise.resolve().then(()=>{captureCorpIdFromUrl();pickTokenFromUrl(this.app);this.app.pm.get(o).registerType("community-ding-talk-auth",{components:{SignInButton:makeSignInButton(this.app),AdminSettingsForm}})})}}
+class i extends t.Plugin{afterAdd(){return Promise.resolve()}beforeLoad(){return Promise.resolve()}load(){return Promise.resolve().then(()=>{captureCorpIdFromUrl();try{pickTokenFromUrl(this.app);}catch(e){console.error("[ding-talk] 回跳 token 处理失败：",e);}this.app.pm.get(o).registerType("community-ding-talk-auth",{components:{SignInButton:makeSignInButton(this.app),AdminSettingsForm}})})}}
 e.NocobasePluginDingTalkClient=i;e.default=i;Object.defineProperties(e,{__esModule:{value:!0},[Symbol.toStringTag]:{value:"Module"}})});
