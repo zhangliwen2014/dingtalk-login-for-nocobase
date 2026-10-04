@@ -245,7 +245,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 
 **22:26 上线**：`dist/client/index.js` → `bbf35e6546dace0b82f96b3b06d81701d23faf8d9533ad92de07d0664ee62b0b`，改前留为同目录 `index.js.bak.20261004e`（`a7350f38…`）；`vm.Script` 通过，下发 URL `?hash=ab493001`，取回内容与仓库逐字节一致。
 
-**还剩的一件事不是代码问题**：CorpId 目前完全依赖「从工作台入口 + 首页地址带 `$CORPID$`」。建议同时在后台认证器配置的「企业 CorpId」一格里填上值（存 `options.internal.corpId`，jsonb，无 schema 变更），这样任何入口都能免登；否则从 `/signin` 直接进来时仍会因 `stage=corpId` 回退扫码。
+**~~还剩的一件事不是代码问题~~ —— 已做完（23:03 复核）**：后台「认证器 → 钉钉 → 企业 CorpId」现在库里已有值，`select options->'internal'->>'corpId' from "authenticators" where name='s_m6bd8kfrhe7'` 返回 `dingce9ecfd28c93970ca1320dcb25e91351`（36 字符），与访问日志里容器注入 `?corpId=` 的那个值逐字符相同，说明手抄没抄错。`POST api/community-ding-talk:getFreeLoginConfig {"authenticator":"s_m6bd8kfrhe7"}` 也随之从 `corpId:null` 变成返回该值（23:02 实测）。因此免登不再依赖「从工作台入口 + 首页地址带 `$CORPID$`」，从 `/signin` 直接进也能拿到 CorpId；两条来源并存时客户端优先用容器注入的那个。
 
 ### 免登已在真机跑通（22:31，iPhone 钉钉 + PC 钉钉）
 
@@ -258,6 +258,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 | 22:31:47 / 22:31:58 | 另两次从 `/signin?redirect=`（redirect 为空）发起的 `freeLogin` 同样 200，22:31:48 `auth:check` 200 且 referer 变成 `/admin` —— `redirectTarget()` 的空值回落 `/admin` 生效 |
 
 身份没有走偏：`usersAuthenticators` 仍只有 1 行（`authenticator=s_m6bd8kfrhe7`／`userId=2`／`uuid=016825045624390379`，创建于 15:31），免登是先按钉钉 `userid` 命中既有绑定再签发，**没有**因为 `userCheckType=mobile` 而撞上同号的其它账号。这一点很重要：库里 13 个用户有手机号、其中存在同号，若匹配顺序反过来就可能登进别人的账号。
+
+> `dbg` 的一个已知短板：22:53 在普通 Mac Chrome 上那次回退，日志里是 `getAuthUrl?dbg=ua%7C%3F%3F%3F%3F%3F%3F%3F%3F` —— 竖线编码正常，但中文那 8 个字全变成了 `?`，说明非 ASCII 在 `encodeURIComponent` 之前就已经丢失（同一份文件在钉钉里回传 `dbg=jsapi|JSAPI 已加载但没有 window.dd` 时中文是完好的，所以不是文件编码问题，而是这条路径上字符串已被替换）。**只影响诊断文案可读性，不影响登录功能**。以后若要靠 `dbg` 排障，应把阶段与原因改成纯 ASCII 码（如 `ua-not-dingtalk`），别指望中文说明。
 
 
 
