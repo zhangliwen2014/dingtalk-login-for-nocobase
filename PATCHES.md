@@ -159,6 +159,21 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 
 **21:40 部署后实测**：`dist/client/index.js` → `cd3d3b9b…`（12185 字节，与仓库逐字节一致；改前那份留成同目录 `index.js.bak.20261004a`），容器内 `node --check` 通过，重启约 23 秒后根路径 200、`publicList` 仍 `allowSignUp:false`、无插件加载错误；`pm:listEnabled` 下发的 URL 变成 `?hash=cdbdcdeb`，且该 URL 取回的内容就是新产物 —— 缓存必然被击穿。
 
+### `dbg` 一上线就抓到了两个根因（21:46–21:52）
+
+| 观测 | 结论 |
+|---|---|
+| `getAuthUrl?dbg=jsapi%7CJSAPI+%3F%3F%3F%3F%3F%3F+window.dd`（`?` 是被过滤的非 ASCII，原文是「JSAPI 已加载但没有 window.dd」） | CDN 脚本 `onload` 成功，但 `window.dd` 不存在 |
+| SPA 里 `grep window.define=` → `p__index.9a5f5b1a.async.js` 的 `initRequireJs()`：`window.define = this.requirejs.define` | **根因 1**：`dingtalk.open.js` 是 UMD，检测顺序是 `module/exports` → `define.amd` → `exports` → `root.dd`。页面里存在 AMD 全局，于是它走 `define([], factory)`，永远不会挂 `window.dd`。自己注 `<script>` 时匿名 define 也配不上任何 requirejs 请求，等于静默丢弃 → 改为优先 `window.requirejs([JSAPI_SRC], cb, errcb)` 取模块导出 |
+| `system_error_2026-10-04.log`：`community-ding-talk/redirectAuth {"errcode":40078,"errmsg":"nonexistent temp auth code"}`，访问日志里回调 URL 是 `…redirectAuth?…&code=11f53c03…&authCode=11f53c03…&state=…` | **根因 2，且是我这次改出来的回归**：钉钉统一授权页的回调**同时**带 `code` 与 `authCode`，且取值相同（那是 OAuth 授权码）。`#resolveDingUser()` 里 `if (authCode)` 优先，导致扫码时拿 OAuth 码去调免登的 `topapi/v2/user/getuserinfo` → 40078。用户 21:5x 反馈「连 PC 网页的扫码登录都不能工作了」即此。**15:31 已验证可用的扫码路径被我弄坏了。** |
+
+修复：`if (authCode)` → `if (authCode && !code)`（免登动作 `freeLogin` 只带 `authCode`，仍走免登分支；扫码回调一定带 `code`，回到 15:31 那条已验证的路径）。
+
+**21:52 上线**：`dist/client/index.js` → `92809b02644c77ba5a4016030b6c8f31e5887c4681c992933f6137bfe0cab678`，`dist/server/auth/DingTalkAuth.js` → `8e7bbe1f0f5baf61630606d8346a33919e30a1f8b82126b5aef25c274e7d91dd`；改前分别留为同目录 `index.js.bak.20261004b`、`DingTalkAuth.js.bak.20261004b`；两文件 `node --check` 通过，重启后 200、`publicList` 正常、无插件加载错误，下发 URL 变为 `?hash=051e9460` 且取回内容 sha256 与仓库一致（提交 `71de2a9`）。
+
+教训：给一个已有登录方式加第二条路径时，**任何「参数同时出现在两条路径上」的优先级判断都必须在真机回归旧路径**，不能只在服务端造请求测新路径 —— 这次 `code`/`authCode` 同名同值只有真实回调才会暴露。
+
+
 ## 部署方式
 
 这个插件不在 Docker 镜像内，而是宿主绑定挂载目录，容器重建不会更新它；但 **NocoBase 后台升级/重装插件会静默覆盖本目录内容**。
