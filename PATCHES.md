@@ -118,6 +118,47 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 - **仍未在钉钉内实测**。差的只剩钉钉侧配置：后台填 `corpId`（或把首页地址设成带 `$CORPID$`）+ 上面 4 项前置条件，然后由业务账号在钉钉内点击验证。
 - 判定成功的依据：`select * from "usersAuthenticators"` 出现带 `uuid` 的行；且 nginx 日志里 `getFreeLoginConfig`/`freeLogin` 有命中、`redirectAuth` 不再被调用。
 
+### 20:21 那次部署后的实测结果：免登没被触发，原因不可见 → 第二次迭代（21:40）
+
+用户在 PC/手机钉钉里点击后仍然只是回退扫码。日志证据（`/var/log/nginx/nocobase.log`，容器内）：
+
+| 时间 | 事实 |
+|---|---|
+| 20:41:35 / 20:43:13 / 20:48:51 / 20:51:54 / 20:52:54 | 钉钉 UA 重新加载页面，`POST /api/authenticators:publicList` 正常 |
+| 20:41:39、20:43:20、20:48:57、20:52:08、20:52:17、20:52:47 | 点击后**只有** `POST /api/community-ding-talk:getAuthUrl`（200） |
+| 全天 | `getFreeLoginConfig`/`freeLogin` 各只有 3 次/1 次命中，`client=172.21.0.1`，全是本机 curl 测试；**浏览器一次都没发过** |
+
+先证明了「浏览器跑的确实是新代码」，排除缓存嫌疑（这一段很关键，否则会误判成 365d 缓存）：
+
+- `?hash=` 的算法在 `@nocobase/server/lib/plugin-manager/options/resource.js`：`sha256(mtime + APP_KEY + package.json.version + @nocobase/server 版本 + PLUGIN_URL_HASH_SALT).slice(0,8)`，**只跟 `dist/client/index.js` 的 mtime 有关**；
+- 按线上进程（`/proc/470/environ`）的 env 复算，20:21 部署后 `mtime=2026-10-04 20:21:20.644` → `027627ac`，与 `pm:listEnabled` 下发值一致；
+- `pm:listEnabled` 响应头是 `Cache-Control: no-cache, no-store` → 每次刷新都拿到变化后的新 URL → 浏览器必然重新下载了新 JS；
+- SDK 侧没有本地 ACL 拦截（`@nocobase/sdk/lib/APIClient.js` 的 `resource()` 只是拼 URL），所以也不是「请求被前端挡掉」。
+
+结论：免登在**发出任何请求之前**就失败并静默回退，而失败点全在浏览器里（服务端不可见）。`/static/plugins/` 那条 location 又是 `access_log off`，连累插件 JS 的请求也不留痕。
+
+两个高概率原因（都能解释上述现象）：
+
+1. **原代码优先用老接口**。入口 referer 里有 `dd_debug_unifiedAppId`、`dd_debug_pid=pcHome`，说明是**新版统一容器**从工作台打开；而 `requestAuthCode()` 里 `if (dd.runtime.permission.requestAuthCode) … else if (dd.getAuthCode)` 优先走 1.x/2.x 的 `dd.runtime.permission.requestAuthCode`。
+2. **`dd.env.platform` 这道硬门槛在 PC 端可能不成立**。CDN 版 JSAPI 的判定是 `isPC = !!containerId || window.dingtalk?.platform?.invokeAPI`，`platform` 最终回落到 `"notInDingTalk"`，而原代码 `if (!inDingTalk(dd)) throw`，判定失败就直接放弃免登。
+
+`21:40` 的第二次部署（提交 `e880827`，只动 `dist/client/index.js`）做了四件事：
+
+| 改动 | 目的 |
+|---|---|
+| `dd.getAuthCode` 与 `dd.runtime.permission.requestAuthCode` **依次尝试**，各自 6s 超时，失败原因逐级累积 | 不再押注单一接口；容器不回调也不会把按钮卡死 |
+| 去掉 `dd.env.platform!=="notInDingTalk"` 硬门槛（UA 已经判过钉钉），并把 `env=<platform>` 写进错误信息 | PC 端判定失败时仍然有机会免登，且判定结果可见 |
+| JSAPI `<script>` 加载加 8s 超时 | 既不 `onload` 也不 `onerror` 时，按钮不会永久转圈且**一条日志都不留** |
+| 回退扫码时把失败阶段+原因作为 **`dbg` 查询参数**带在 `getAuthUrl` 上 | nginx 记录 request 行（不含 POST body），于是 `POST /api/community-ding-talk:getAuthUrl?dbg=authcode\|getAuthCode:无响应 ; requestAuthCode:{"errorCode":7,...} env=pc` 这样的一行就是最终诊断依据 |
+
+顺带把 `captureCorpIdFromUrl()` 改成在**整条 URL** 上匹配 `corpId`：登录守卫会把入口地址塞进 `redirect=`（实测 referer 为 `/signin?redirect=/m?corpId=ding…`），此时它不再是顶层参数，只查 `location.search` 会漏。
+
+`dbg` 只保留 ASCII，并把邮箱抹成 `[mail]`、7 位以上数字抹成 `[num]`（`DingTalkAuth.js` 有两处报错会带上用户邮箱，不能借着诊断写进访问日志）。
+
+服务端 `getAuthUrl` 只读 `ctx.action.params.values`，多出来的 `dbg` 是 query 参数、会被忽略，无需改服务端。
+
+**21:40 部署后实测**：`dist/client/index.js` → `cd3d3b9b…`（12185 字节，与仓库逐字节一致；改前那份留成同目录 `index.js.bak.20261004a`），容器内 `node --check` 通过，重启约 23 秒后根路径 200、`publicList` 仍 `allowSignUp:false`、无插件加载错误；`pm:listEnabled` 下发的 URL 变成 `?hash=cdbdcdeb`，且该 URL 取回的内容就是新产物 —— 缓存必然被击穿。
+
 ## 部署方式
 
 这个插件不在 Docker 镜像内，而是宿主绑定挂载目录，容器重建不会更新它；但 **NocoBase 后台升级/重装插件会静默覆盖本目录内容**。
