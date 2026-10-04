@@ -117,7 +117,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
   - 上游 `getAuthUrl` 仍返回正确的 `login.dingtalk.com` 授权 URL（扫码路径无回归）；
   - `docker logs` 里没有插件加载错误，`system.log` 无新增异常；`authenticators:publicList` 仍回 `allowSignUp:false`；
   - `/static/plugins/nocobase-plugin-ding-talk/dist/client/index.js` 已是新的 9069 字节产物（含 `freeLogin`/`requestAuthCode`/`nocobase-dingtalk-corpid`）。
-- ~~**仍未在钉钉内实测**~~ —— **已于 22:31 真机验证通过**（iPhone 钉钉 + PC 钉钉，见下文「免登已在真机跑通」）。20:21 这一版当时确实还没跑通，卡在 JSAPI 加载；后面又迭代了四次（21:40 / 21:52 / 22:05 / 22:18 / 22:26）才通。
+- ~~**仍未在钉钉内实测**~~ —— **已于 22:31 真机验证通过**（iPhone 钉钉 + PC 钉钉，见下文「免登已在真机跑通」）。20:21 这一版当时确实还没跑通，卡在 JSAPI 加载；后面又迭代了五次（21:40 / 21:52 / 22:05 / 22:18 / 22:26）才通。
+- 版本管理：**全部 15 个提交已于 22:52 推送到 GitHub**（`origin/main` = `1374185` = 本地 HEAD，`git rev-list --count origin/main..HEAD` 为 0）。此前「服务器在跑但 GitHub 没有」的窗口已关闭。
 - 判定成功的依据（已满足）：nginx 日志里浏览器发起 `getFreeLoginConfig` + `freeLogin` 200，且**同一次会话的 `auth:check` 由 401 变 200**；`usersAuthenticators` 保持 1 行（`userId=2`／`uuid=016825045624390379`），说明走的是「按钉钉 `userid` 命中既有绑定」而不是手机号匹配。
 
 ### 20:21 那次部署后的实测结果：免登没被触发，原因不可见 → 第二次迭代（21:40）
