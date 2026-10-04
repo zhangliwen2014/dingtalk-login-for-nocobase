@@ -36,7 +36,15 @@
 | `dist/server/actions/dingTalkActions.js` | 新增 `getFreeLoginConfig`（只回 `corpId`，appKey/appSecret 不出服务端）、`freeLogin`（authCode → token，JSON 返回，不整页跳转） |
 | `dist/client/index.js` | `SignInButton`：UA 含 `DingTalk` → 取 `corpId` → 载入 JSAPI（CDN `https://g.alicdn.com/dingding/dingtalk-jsapi/3.1.0/dingtalk.open.js`，官方文档中的「方式二」，因 dist-only 无构建步骤只能这么引）→ `dd.ready` + `requestAuthCode({corpId})`（无三段式时回落 `dd.getAuthCode`）→ `freeLogin` → `auth.setAuthenticator()`+`auth.setToken()` → reload。任一环节失败自动回退扫码，不会把人锁在门外 |
 
-配置：认证器 `options.internal.corpId`（管理后台认证器配置表单已加「企业 CorpId」输入框，存 jsonb，无 schema 变更）。
+配置：`corpId` 有两个来源，客户端按「容器注入的 URL 参数 → 服务端配置」的顺序取。
+
+| 方式 | 做法 | 说明 |
+|---|---|---|
+| **A. `$CORPID$` 占位符（推荐）** | 钉钉开发者后台 → 应用 → 基础信息 → 开发管理 → 应用首页地址与 PC 端首页地址填 `https://device-mgmt.aiaocheng.com/?corpId=$CORPID$` | 从**工作台**打开时容器会替换成真实 CorpId（官方文档明确：只有在工作台打开才会替换）。后台的「企业 CorpId」输入框可以留空，不必手抄 |
+| B. 后台手填 | 认证器配置表单 →「企业 CorpId」→ 存 `options.internal.corpId`（jsonb，无 schema 变更） | CorpId 在**开发者后台首页**，不在应用详情页（详情页只有 AppKey/AppSecret/AgentId，这也是常见困惑点）。需匹配 `^ding[a-z0-9]+$` |
+
+入口 URL 上的 `corpId` 由 `load()` 里最早的 `captureCorpIdFromUrl()` 暂存进 `sessionStorage`——SPA 路由跳转会丢参数，只有入口这一趟拿得到。
+
 
 **部署前必须由使用方在钉钉开放平台确认的前置条件**（缺一不可，否则免登必然回退扫码）：
 
