@@ -11,6 +11,11 @@
 // ==== 本文件为 dist 手工维护版本（见仓库 PATCHES.md）：新增钉钉客户端内免登，保留原扫码登录 ====
 var JSAPI_SRC = "https://g.alicdn.com/dingding/dingtalk-jsapi/3.1.0/dingtalk.open.js";
 var PENDING_KEY = "nocobase-dingtalk-pending";
+var CORPID_KEY = "nocobase-dingtalk-corpid";
+// load() 在应用启动路径上执行，sessionStorage 一旦抛异常会把整个 SPA 带崩，所以全部包住
+function ssGet(k){try{return sessionStorage.getItem(k);}catch(e){return null;}}
+function ssSet(k,v){try{sessionStorage.setItem(k,v);}catch(e){}}
+function ssDel(k){try{sessionStorage.removeItem(k);}catch(e){}}
 var jsapiLoading;
 function loadJsApi(){
   if(typeof window==="undefined"||typeof document==="undefined")return Promise.reject(new Error("no browser"));
@@ -54,8 +59,8 @@ function pickTokenFromUrl(app){
   var token=usp.get("token");
   var authenticator=usp.get("authenticator");
   if(!token||!authenticator)return false;
-  if(sessionStorage.getItem(PENDING_KEY)!==authenticator)return false;
-  sessionStorage.removeItem(PENDING_KEY);
+  if(ssGet(PENDING_KEY)!==authenticator)return false;
+  ssDel(PENDING_KEY);
   usp.delete("token");
   usp.delete("authenticator");
   var query=usp.toString();
@@ -75,16 +80,25 @@ var makeSignInButton=function(app){
       return resource.getAuthUrl({values:{authenticator:authenticator.name,redirect:new URLSearchParams(location.search?location.search.substring(1):"").get("redirect")||""}}).then(function(m){
         var url=m&&m.data&&m.data.data;
         if(typeof url!=="string"||url.indexOf("https://login.dingtalk.com/")!==0)throw new Error("getAuthUrl 返回异常");
-        sessionStorage.setItem(PENDING_KEY,authenticator.name);
+        ssSet(PENDING_KEY,authenticator.name);
         location.href=url;
       });
     };
     var freeLogin=function(){
       // 先用 UA 判断，避免在非钉钉环境里白拉一次 JSAPI
       if(!/DingTalk/i.test(navigator.userAgent||""))return Promise.reject(new Error("不在钉钉客户端内"));
-      return resource.getFreeLoginConfig({values:{authenticator:authenticator.name}}).then(function(m){
-        var corpId=m&&m.data&&m.data.data&&m.data.data.corpId;
-        if(!corpId)throw new Error("未配置企业 CorpId");
+      // corpId 两个来源，优先容器注入的那个：钉钉应用首页地址写成 …?corpId=$CORPID$ 时，
+      // 从工作台打开会被容器替换成真实 CorpId，无需在后台手抄
+      var fromUrl=ssGet(CORPID_KEY);
+      var corpIdOf=function(){
+        if(fromUrl)return Promise.resolve(fromUrl);
+        return resource.getFreeLoginConfig({values:{authenticator:authenticator.name}}).then(function(m){
+          var d=m&&m.data&&m.data.data;
+          return d&&d.corpId;
+        });
+      };
+      return corpIdOf().then(function(corpId){
+        if(!corpId)throw new Error("拿不到企业 CorpId：请在钉钉应用首页地址加 ?corpId=$CORPID$，或在认证器配置里填「企业 CorpId」");
         return loadJsApi().then(function(dd){
           if(!inDingTalk(dd))throw new Error("不在钉钉客户端内");
           return requestAuthCode(dd,corpId);
@@ -116,7 +130,14 @@ var makeSignInButton=function(app){
 };
 var AdminSettingsForm=function(props){
   console.log("aaa",props);
-  return r.jsx(t.SchemaComponent,{schema:{type:"object",properties:{communityDingTalkAuth:{type:"void",properties:{public:{type:"object",properties:{autoSignup:{"x-decorator":"FormItem",type:"boolean",title:"用户不存在时自动注册",required:!1,"x-component":"Checkbox"}}},internal:{type:"object",properties:{userCheckType:{"x-decorator":"FormItem",type:"string",title:"用户验证方式",required:!0,"x-component":"Select","x-component-props":{options:[{value:"orgEmail",label:"企业邮箱"},{value:"personalEmail",label:"个人邮箱"},{value:"mobile",label:"手机号"}]}},emailDomain:{"x-decorator":"FormItem",type:"string",title:"邮箱域名，多个使用英文逗号分隔",required:!0,"x-component":"Input"},corpId:{"x-decorator":"FormItem",type:"string",title:"企业 CorpId（钉钉客户端内免登必填）",required:!1,"x-component":"Input","x-component-props":{placeholder:"ding 开头，钉钉开放平台应用基本信息里查看"}},appKey:{"x-decorator":"FormItem",type:"string",title:"应用ID",required:!0,"x-component":"Input"},appSecret:{"x-decorator":"FormItem",type:"string",title:"应用秘钥",required:!0,"x-component":"Password"}}}}}}}});
+  return r.jsx(t.SchemaComponent,{schema:{type:"object",properties:{communityDingTalkAuth:{type:"void",properties:{public:{type:"object",properties:{autoSignup:{"x-decorator":"FormItem",type:"boolean",title:"用户不存在时自动注册",required:!1,"x-component":"Checkbox"}}},internal:{type:"object",properties:{userCheckType:{"x-decorator":"FormItem",type:"string",title:"用户验证方式",required:!0,"x-component":"Select","x-component-props":{options:[{value:"orgEmail",label:"企业邮箱"},{value:"personalEmail",label:"个人邮箱"},{value:"mobile",label:"手机号"}]}},emailDomain:{"x-decorator":"FormItem",type:"string",title:"邮箱域名，多个使用英文逗号分隔",required:!0,"x-component":"Input"},corpId:{"x-decorator":"FormItem",type:"string",title:"企业 CorpId（钉钉客户端内免登必填）",required:!1,"x-component":"Input","x-component-props":{placeholder:"ding 开头，形如 dingxxxxxxxx。在钉钉开发者后台「首页」查看；也可把应用首页地址写成 …?corpId=$CORPID$ 由容器注入，留空即可"}},appKey:{"x-decorator":"FormItem",type:"string",title:"应用ID",required:!0,"x-component":"Input"},appSecret:{"x-decorator":"FormItem",type:"string",title:"应用秘钥",required:!0,"x-component":"Password"}}}}}}}});
 };
-class i extends t.Plugin{afterAdd(){return Promise.resolve()}beforeLoad(){return Promise.resolve()}load(){return Promise.resolve().then(()=>{pickTokenFromUrl(this.app);this.app.pm.get(o).registerType("community-ding-talk-auth",{components:{SignInButton:makeSignInButton(this.app),AdminSettingsForm}})})}}
+function captureCorpIdFromUrl(){
+  // 必须在 load() 里最早执行：路由跳转会丢参数，$CORPID$ 替换出来的值只有入口这一趟拿得到
+  if(typeof window==="undefined")return;
+  var usp=new URLSearchParams(window.location.search);
+  var corpId=usp.get("corpId")||usp.get("corpid");
+  if(corpId&&/^ding[a-z0-9]+$/i.test(corpId))ssSet(CORPID_KEY,corpId);
+}
+class i extends t.Plugin{afterAdd(){return Promise.resolve()}beforeLoad(){return Promise.resolve()}load(){return Promise.resolve().then(()=>{captureCorpIdFromUrl();pickTokenFromUrl(this.app);this.app.pm.get(o).registerType("community-ding-talk-auth",{components:{SignInButton:makeSignInButton(this.app),AdminSettingsForm}})})}}
 e.NocobasePluginDingTalkClient=i;e.default=i;Object.defineProperties(e,{__esModule:{value:!0},[Symbol.toStringTag]:{value:"Module"}})});
