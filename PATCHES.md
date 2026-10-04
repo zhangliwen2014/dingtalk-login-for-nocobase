@@ -209,6 +209,43 @@ curl -X POST -H 'Content-Type: application/json' -d '{"authenticator":"s_m6bd8kf
 - 「grep 全 SPA 产物」必须把**所有** `plugin-*/dist/client`（含数字分块）一起扫，只扫主包会得出相反的结论。
 - 启动路径（`load()`）里的任何自加逻辑都要假定外部 API 可能不存在；一个未加保护的属性访问会把整站变白屏，比原来的功能缺失严重得多。
 
+### 第四次迭代（22:18）：钉钉容器里没有 `requirejs`，只有 `define` —— 改用自定义 define 接管 UMD
+
+22:15（PC 钉钉，UA 含 `DingTalk(9.0.1-macOS…) nw DTWKWebView`）与 22:16（iOS 钉钉，`AliApp(DingTalk/9.0.4)`）两次点击，`dbg` 都是 `jsapi|JSAPI 已加载但没有 window.dd`。
+这条信息来自 21:52 那版的普通 `<script>` 注入分支，而该分支**只在 `typeof window.requirejs !== "function"` 时才会走到** —— 也就是说上一版「改走 requirejs」的假设在钉钉容器里不成立：容器提供的是 `window.define`（带 `.amd`），不是 `window.requirejs`。UMD 因此仍然走 `define([],factory)`，既不挂 `window.dd`，也没有别的加载器来解析这个匿名 define，两头落空。
+
+改法（`dist/client/index.js`）：
+
+| 改动 | 目的 |
+|---|---|
+| 新增 `viaShim()`：短暂把 `window.define` 换成自己的实现（同时 `delete window.requirejs/require` 逼 UMD 命中 AMD 分支），接住 `define(factory)` / `define(["exports"],factory)` 两种形态，取到导出后**立刻恢复原全局** | 不依赖容器有没有 requirejs，也不改变页面长期的全局状态 |
+| `shim` 只接住「匿名 define / 仅 `exports` 依赖」的调用，其它依赖名原样转回容器自己的 `define` | 避免误接管页面里其它 AMD 模块 |
+| 加载顺序：已有 `window.dd` → 直接用；有 `requirejs` → 走 requirejs（失败再兜 shim）；否则直接 shim；shim 再失败才退回普通注 script | 三条路都试，任一成功即免登 |
+| 新增 `envSnap()`，把 `dd/define/define.amd/requirejs/require` 的类型拼进每条 JSAPI 失败信息 | 下次 `dbg=` 直接看得出容器里到底有什么，不用再猜 |
+| `loadJsApi()` 外层超时 8s → 15s（要大于 shim 内部 12s） | 否则 shim 还没执行完就被外层判超时，白丢一次机会 |
+
+**22:18 上线**：`dist/client/index.js` → `a7350f383c265eae50b7eaa2bb49544bcc08fdd7591cb025d1328d3c96e908ba`（18332 字节），改前留为同目录 `index.js.bak.20261004d`（`b3047dcb…`）；`vm.Script` 通过，重启后下发 URL `?hash=c368230d` 且取回内容与仓库逐字节一致。
+
+**免登链路由此打通（22:20–22:21 访问日志）**：
+
+| 时间 | 事实 |
+|---|---|
+| 22:20:51 / 22:21:06 | 浏览器**首次**发起 `POST …:getFreeLoginConfig`（200）—— 说明已过 UA 判定，进入免登流程 |
+| 同上 | 紧跟 `getAuthUrl?dbg=corpId\|拿不到企业 CorpId…?corpId=$CORPID$…` —— 这一步是**入口 URL 决定**的：从 `/signin?redirect=/admin` 进来时 URL 里没有容器注入的 CorpId，sessionStorage 也是空的 |
+| 22:21:34 | 改从工作台入口进（`GET /?corpId=ding…`），`captureCorpIdFromUrl()` 抓到注入值 |
+| 22:21:36 | `POST …:freeLogin` **200**（JSON，token 不进 URL、不落访问日志） |
+| 22:21:36 之后 | `GET /signin?redirect=/admin` → **`GET /api/auth:check` 200**（此前 22:21:34 同一次会话是 401）→ 服务端已签发并被接受，免登身份链完整跑通 |
+
+### 第五次迭代（22:26）：已登录却停在登录页 —— `freeLogin` 后不能只 reload
+
+`freeLogin` 拿到 token、`auth:check` 已经 200，但客户端成功分支写的是 `window.location.reload()`，而当前文档 URL 就是 `/signin?redirect=/admin`，于是重载后仍然停在登录页 —— **用户看到的「钉钉内还是不行」其实是这一步，不是免登失败**。
+
+改法：新增 `goAfterAuth()` —— 若当前 pathname 是 `/signin` 就 `location.replace(redirectTarget())`，否则维持 reload；`redirectTarget()` 取 URL 上的 `redirect`，**只接受站内绝对路径**（`/^\/[^/]/`，同时挡掉 `//host` 这种协议相对形式），否则回落 `/admin`。扫码回跳的 `pickTokenFromUrl` 也改用 `goAfterAuth()`。
+
+**22:26 上线**：`dist/client/index.js` → `bbf35e6546dace0b82f96b3b06d81701d23faf8d9533ad92de07d0664ee62b0b`，改前留为同目录 `index.js.bak.20261004e`（`a7350f38…`）；`vm.Script` 通过，下发 URL `?hash=ab493001`，取回内容与仓库逐字节一致。
+
+**还剩的一件事不是代码问题**：CorpId 目前完全依赖「从工作台入口 + 首页地址带 `$CORPID$`」。建议同时在后台认证器配置的「企业 CorpId」一格里填上值（存 `options.internal.corpId`，jsonb，无 schema 变更），这样任何入口都能免登；否则从 `/signin` 直接进来时仍会因 `stage=corpId` 回退扫码。
+
 
 ## 部署方式
 

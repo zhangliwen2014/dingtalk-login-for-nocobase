@@ -38,6 +38,70 @@ function viaRequireJs(){
     }catch(e){fail(e);}
   });
 }
+function envSnap(){
+  // 诊断信息要能进 nginx 的 request 行，只能是 ASCII，且要短
+  try{
+    return "dd="+typeof window.dd+" def="+typeof window.define+" amd="+(window.define&&window.define.amd?1:0)
+      +" rjs="+typeof window.requirejs+" req="+typeof window.require;
+  }catch(e){return "snap!"}
+}
+function viaShim(){
+  // 钉钉容器（PC 的 DTWKWebView、iOS 的 AliApp(DingTalk)）里实测：window.define 是函数且带 .amd，
+  // 而 window.requirejs 不是函数 —— UMD 于是走 define([],factory) 分支，既不挂 window.dd 也没人解析它。
+  // 这里短暂地把自己的 define 换上去（并把 requirejs/require 遮掉，逼 UMD 走 AMD 分支命中我们），
+  // 拿到 factory 的导出后立刻恢复原全局。
+  return new Promise(function(resolve,reject){
+    var done=false, exp={}, script=null;
+    var d0=window.define, r0=window.requirejs, q0=window.require;
+    function restore(){
+      try{ if(d0===undefined){delete window.define;}else{window.define=d0;} }catch(e){}
+      try{ if(r0===undefined){delete window.requirejs;}else{window.requirejs=r0;} }catch(e){}
+      try{ if(q0===undefined){delete window.require;}else{window.require=q0;} }catch(e){}
+    }
+    function cleanup(){
+      restore();
+      if(script&&script.parentNode)script.parentNode.removeChild(script);
+    }
+    function finish(v){
+      if(done)return;done=true;clearTimeout(timer);cleanup();
+      var dd=v&&typeof v==="object"?(v.dd&&typeof v.dd==="object"?v.dd:v):null;
+      if(dd&&dd.env)return resolve(dd);
+      var g=grabDd();
+      if(g)return resolve(g);
+      reject(new Error("shim 未取得导出 "+envSnap()));
+    }
+    var timer=setTimeout(function(){
+      if(done)return;done=true;cleanup();
+      reject(new Error("shim 超时 "+envSnap()));
+    },12000);
+    function shim(deps,factory){
+      // 只接住「匿名/仅 exports」的 define（那就是 JSAPI），别的依赖名原样交回容器自己的 define
+      var names=(typeof deps==="function")?[]:(deps||[]);
+      var mine=(typeof deps==="function")||(names.length===0)||(names.length===1&&names[0]==="exports");
+      if(!mine){ try{ return d0.apply(null,arguments); }catch(e){ return reject(new Error("shim 转发失败 "+String((e&&e.message)||e).slice(0,80))); } }
+      try{
+        var args=names.map(function(n){ return n==="exports"?exp:undefined; });
+        var ret=factory?factory.apply(null,args):undefined;
+        finish(ret&&typeof ret==="object"?ret:exp);
+      }catch(e){
+        if(done)return;done=true;clearTimeout(timer);cleanup();
+        reject(new Error("shim factory "+String((e&&e.message)||e).slice(0,100)));
+      }
+    }
+    shim.amd=(d0&&d0.amd)?d0.amd:{};
+    try{
+      window.define=shim;
+      try{ delete window.requirejs; }catch(e){ window.requirejs=undefined; }
+      try{ delete window.require; }catch(e){ window.require=undefined; }
+    }catch(e){ restore(); return reject(new Error("shim 无法接管 define "+envSnap())); }
+    script=document.createElement("script");
+    script.src=JSAPI_SRC;
+    script.async=true;
+    script.onload=function(){ if(!done)finish(exp); };
+    script.onerror=function(){ if(done)return;done=true;clearTimeout(timer);cleanup();reject(new Error("shim 脚本加载失败 "+envSnap())); };
+    (document.head||document.documentElement).appendChild(script);
+  });
+}
 function loadJsApi(){
   if(typeof window==="undefined"||typeof document==="undefined")return Promise.reject(new Error("no browser"));
   var have=grabDd();
@@ -45,27 +109,27 @@ function loadJsApi(){
   // NocoBase 的 PluginManager.initRequireJs() 会设 window.define = requirejs.define（见 SPA 的
   // p__index.*.async.js），而 CDN 上的 dingtalk.open.js 是 UMD：它优先走 define([],factory)，
   // 于是自己 <script src> 注入时 onload 成功却没有 window.dd（2026-10-04 21:46 实测 dbg=jsapi|…）。
-  if(typeof window.requirejs==="function"){jsapiLoading=viaRequireJs();return jsapiLoading;}
+  if(typeof window.requirejs==="function"){jsapiLoading=viaRequireJs().catch(function(e){
+    // requirejs 这条路走不通（例如它解析不到 CDN 模块），再用自定义 define 兜一次
+    return viaShim().catch(function(){throw e;});
+  });return jsapiLoading;}
   if(!jsapiLoading){
-    jsapiLoading=new Promise(function(resolve,reject){
-      var s=document.createElement("script");
-      s.src=JSAPI_SRC;
-      s.async=true;
-      s.onload=function(){
-        var dd=grabDd();
-        if(dd)return resolve(dd);
-        // 走到这里说明 define 被页面的 AMD 加载器接管了；它可能稍后才挂上 requirejs
-        if(typeof window.requirejs==="function")return resolve(viaRequireJs());
-        reject(new Error("JSAPI 已加载但没有 window.dd"));
-      };
-      s.onerror=function(){jsapiLoading=null;reject(new Error("钉钉 JSAPI 加载失败"));};
-      document.head.appendChild(s);
+    jsapiLoading=viaShim().catch(function(e){
+      // 极端情况：连 define 都接管不了，退回最初的注 script 写法，碰碰 global 分支
+      return new Promise(function(resolve,reject){
+        var s=document.createElement("script");
+        s.src=JSAPI_SRC;s.async=true;
+        s.onload=function(){var dd=grabDd();if(dd)return resolve(dd);reject(new Error(((e&&e.message)||e)+" | onload 后仍无 window.dd "+envSnap()));};
+        s.onerror=function(){jsapiLoading=null;reject(new Error("钉钉 JSAPI 加载失败 "+envSnap()));};
+        document.head.appendChild(s);
+      });
     });
   }
   // 弱网下 script 可能既不 onload 也不 onerror，没有超时的话按钮会一直转圈，连回退都不会发生
+  // 上限要大于 viaShim 内部的 12s，否则它还没执行完就被这里判超时，白丢一次机会
   return new Promise(function(resolve,reject){
     var done=false;
-    var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("钉钉 JSAPI 加载超时"));},8000);
+    var timer=setTimeout(function(){if(done)return;done=true;reject(new Error("钉钉 JSAPI 加载超时 "+envSnap()));},15000);
     var p=jsapiLoading;
     p.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);},function(e){if(done)return;done=true;clearTimeout(timer);reject(e);});
   });
@@ -130,6 +194,21 @@ function authOf(app){
   }
   return null;
 }
+function redirectTarget(){
+  // 免登成功后必须离开 /signin：2026-10-04 22:21 实测 freeLogin 已拿到 token、重载后
+  // auth:check 返回 200（会话其实已认证），但 reload 停在登录页上，看起来就像「登录不了」。
+  // 登录守卫把目标放在 redirect 上，这里跟着它走；只接受站内绝对路径，避免开放重定向。
+  var r=null;
+  try{ r=new URLSearchParams(window.location.search).get("redirect"); }catch(e){}
+  if(!r||!/^\/[^/]/.test(r))r="/admin";
+  return r;
+}
+function goAfterAuth(){
+  try{
+    if(/^\/signin\b/.test(window.location.pathname)){window.location.replace(redirectTarget());return;}
+  }catch(e){}
+  window.location.reload();
+}
 function pickTokenFromUrl(app){
   // 扫码登录回跳：redirectAuth 把 token 放在 URL 上。插件自身的 AuthProvider 也会处理，
   // 这里只是提前一步把它收进 auth 并抹掉参数；拿不到 auth 就放弃，绝不让 load() 抛异常。
@@ -154,7 +233,7 @@ function pickTokenFromUrl(app){
   var query=usp.toString();
   var clean=window.location.pathname+(query?"?"+query:"")+window.location.hash;
   window.history.replaceState({}, "", clean);
-  window.location.reload();
+  goAfterAuth();
   return true;
 }
 var makeSignInButton=function(app){
@@ -200,7 +279,7 @@ var makeSignInButton=function(app){
           if(!auth)throw mkErr("auth","客户端 auth 未就绪");
           auth.setAuthenticator(data.authenticator||authenticator.name);
           auth.setToken(data.token);
-          window.location.reload();
+          goAfterAuth();
         },function(e){throw mkErr("server",serverMsg(e));});
       });
     };
